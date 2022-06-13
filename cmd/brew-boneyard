@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#:`brew boneyard` [options] *formula* ...
+#:    Collects "bones" of `homebrew/core/`*formula* for storage
+#:    `--tap=`*tap* : Boneyard tap (default: gromgit/boneyard)
+
+# shellcheck source=/dev/null
+. "$(dirname "$0")/../lib/funcs.sh"
+
+trap cleanup EXIT
+trap err_rename ERR
+
+cleanup() {
+  [[ -n $tmpdir ]] || return
+  info "----- Nuking $tmpdir -----"
+  rm -fr "$tmpdir"
+  tmpdir=""
+}
+
+err_rename() {
+  [[ -n $tmpdir ]] || return
+  mv "$tmpdir" "$tmpdir".b0rken
+  error "Bone collecting failed, temp dir moved to ${tmpdir}.b0rken"
+}
+
+jquery() {
+  jq -r ".[] | $*" ./.base_json
+}
+
+shopt -s lastpipe
+for cmd in jq gh oras; do
+  if ! command -v "$cmd" &>/dev/null; then
+    brew install "$cmd" || fatal "$cmd not available"
+  fi
+done
+
+# Ref: https://github.com/Homebrew/brew/issues/13012#issuecomment-1073305666
+export HOMEBREW_BOTTLE_SUDO_PURGE=1
+
+core_tap=homebrew/core
+bone_tap=gromgit/boneyard
+tap_base=$(brew --repo homebrew/core); tap_base=${tap_base%/homebrew/homebrew-core}
+
+while true; do
+  case "$1" in
+    --tap=*) bone_tap=${1#*=};;
+    --tap) bone_tap=$2; shift;;
+    *) break;;
+  esac
+  shift
+done
+
+core_base=$(brew --repo "$core_tap")
+bone_base=$(brew --repo "$bone_tap")
+bone_repo=${bone_tap/\///homebrew-}
+
+set -e
+
+for f in "$@"; do
+
+  [[ -s ${core_base}/Formula/${f}.rb ]] || {
+    warn "$f not found, skipping."
+    continue
+  }
+
+  tmpdir=$(mktemp -d)
+
+(
+  cd "$tmpdir"
+  cmd brew info --json --formula "$f" > ./.base_json
+  ver=$(jquery .versions.stable)
+  rev=$(jquery .revision); rev=${rev##0}
+  rebuild=$(jquery .bottle.stable.rebuild); rebuild=${rebuild##0}
+  fver=${ver}${rev:+_}${rev}${rebuild:+-}${rebuild}
+
+  # Pull down all the available bottles
+  cmd oras pull "ghcr.io/${core_tap}/${f}:${fver}"
+
+  # Rename any double-dashed ones
+  for t in *--*.tar.*; do
+    if [[ -s $t ]]; then
+      cmd mv -v "$t" "${t/--/-}"
+    fi
+  done
+
+  # Upload them all
+  root_url=https://github.com/${bone_repo}/releases/download/${f}-${fver}
+  tag=${root_url##*/}
+  if cmd gh release view "$tag" -R "$bone_repo" >&/dev/null; then
+    # Release already created
+    cmd gh release upload "$tag" ./*.tar.* -R "$bone_repo" --clobber </dev/null
+  else
+    # We need to create it with this new file
+    cmd gh release create "$tag" ./*.tar.* -R "$bone_repo" -t "$f $fver" -n "Bottles downloaded on $(date)" </dev/null
+  fi
+
+  # Add root_url to bottle block
+  sed -e '/deprecate!/d' -e '/disable!/d' -e '/bottle do/a\
+    root_url "'"${root_url}"'"
+' "${core_base}/Formula/${f}.rb" > "${bone_base}/Formula/${f}.rb"
+  cmd brew style --fix "${bone_tap}/${f}"
+
+  # Commit the new boneyard formula
+  cmd git -C "$bone_base" add "Formula/${f}.rb"
+  cmd git -C "$bone_base" commit -m "${f}: archived"
+)
+
+  # Cleanup temp dir
+  cleanup
+
+done
+
+# Update repo with commits
+cmd git -C "$bone_base" push
