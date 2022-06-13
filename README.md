@@ -1,4 +1,6 @@
-# Gromgit Boneyard
+# gromgit's Homebrew Boneyard: where Homebrew core formulae go to die
+
+These formulae were removed from Homebrew core because there were no longer being maintained.
 
 ## How do I install these formulae?
 
